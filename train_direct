@@ -1,0 +1,491 @@
+from __future__ import print_function
+import os
+import sys
+from shutil import copy
+import torch
+from torch import nn, optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from util import *
+from models import *
+import logging
+
+
+parser = argparse.ArgumentParser(description='Train Variational Directed Graph Auto-Encoders')
+# general settings
+parser.add_argument('--data-type', default='WebKB', help='graph datatype name: WebKB, cora, citeseer, WikiCS')
+parser.add_argument('--data-name', default='Cornell', help='graph dataset name: Cornell, Texas, Wisconsin, cora, citeseer, WikiCS')
+parser.add_argument('--nvt', type=int, default=6, help='number of different node types')
+parser.add_argument('--save-appendix', default='_directed_link_prediction', help='suffix for results')
+parser.add_argument('--save-interval', type=int, default=100, metavar='N', help='interval for saving model states')
+parser.add_argument('--reprocess', action='store_true', default=True, help='if True, reprocess training data, else use the already processed one saved in .pk')
+parser.add_argument('--keep-old', action='store_true', default=False, help='if True, keep old data in the result folder')
+parser.add_argument('--link-prediction', default=False, help='if True, mask the link randomly')
+parser.add_argument('--add-mask', default=False, help='if True, add mask for reconstruction')
+
+# model settings
+parser.add_argument('--model', default='VDGAE')
+parser.add_argument('--continue-from', type=int, default=1000, help="from specific checkpoint to continue the training process")
+parser.add_argument('--hs', type=int, default=64, metavar='N', help='hidden size of the model')
+parser.add_argument('--nz', type=int, default=32, metavar='N', help='number of dimensions of the latent vectors z')
+parser.add_argument('--with_neighbor', default=False, help='if True, add mask for reconstruction')
+parser.add_argument('--with_vertex', default=True, help='if True, add mask for reconstruction')
+parser.add_argument('--node_classification', default=False, help='if True, add mask for reconstruction')
+
+# optimization settings
+parser.add_argument('--lr', type=float, default=1e-3, metavar='LR', help='learning rate (default: 1e-3)')
+parser.add_argument('--epochs', type=int, default=1000, metavar='N')
+parser.add_argument('--batch-size', type=int, default=32, metavar='N')
+parser.add_argument('--infer-batch-size', type=int, default=64, metavar='N', help='inference batch size')
+parser.add_argument('--no-cuda', action='store_true', default=False, help='disable CUDA')
+parser.add_argument('--seed', type=int, default=1, metavar='S', help='random seed (default: 1)')
+parser.add_argument('--save', type=str, default='logs')
+
+args = parser.parse_args()
+args.cuda = not args.no_cuda and torch.cuda.is_available()
+torch.manual_seed(args.seed)
+if args.cuda:
+    torch.cuda.manual_seed(args.seed)
+    device = torch.device("cuda:0")
+else:
+    device = torch.device("cpu")
+np.random.seed(args.seed)
+random.seed(args.seed)
+
+# path initializing
+args.file_dir = os.path.dirname(os.path.realpath('__file__'))
+args.res_dir = os.path.join(args.file_dir, 'results/{}{}'.format(args.data_name, args.save_appendix))
+args.save = args.res_dir
+
+if not os.path.exists(args.res_dir):
+    os.makedirs(args.res_dir)
+
+# logging settings
+log_format = '%(asctime)s %(message)s'
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=log_format, datefmt='%m/%d %I:%M:%S %p')
+fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
+fh.setFormatter(logging.Formatter(log_format))
+logging.getLogger().addHandler(fh)
+logging.info("args = %s", args)
+
+pkl_name = os.path.join(args.res_dir, args.data_name + '.pkl')
+
+# check whether to load already processed dataset
+if os.path.isfile(pkl_name) and not args.reprocess:
+    with open(pkl_name, 'rb') as f:
+        train_data, test_data, graph_args = pickle.load(f)
+
+# otherwise process the raw data and save to .pkl
+else:
+    if args.data_type == 'cora':
+        adj, features, labels, edges, idx_train, idx_test, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H, graph_args = load_cora_edges(dataset=args.data_name)
+        train_data = (adj, features, labels, edges, idx_train, idx_test, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H)
+        test_data = (adj, features, labels, edges, idx_train, idx_test, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H)
+    elif args.data_type == 'citeseer':
+        adj, features, labels, edges, idx_train, idx_test, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H, graph_args = load_citeseer_edges()
+        train_data = (adj, features, labels, edges, idx_train, idx_test, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H)
+        test_data = (adj, features, labels, edges, idx_train, idx_test, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H)
+    elif args.data_type == 'WebKB':
+        edge_label, features, labels, edges, idx_train, idx_test, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H, graph_args = load_WebKB_edges(dataset=args.data_name)
+        train_data = (edge_label, features, labels, edges, idx_train, idx_test, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H)
+        test_data = (edge_label, features, labels, edges, idx_train, idx_test, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H)
+    with open(pkl_name, 'wb') as f:
+        pickle.dump((train_data, test_data, graph_args), f)
+
+# delete old files in the result directory
+remove_list = [f for f in os.listdir(args.res_dir) if not f.endswith(".pkl") and
+               not f.startswith('train_graph') and not f.startswith('test_graph') and
+               not f.endswith('.pth') and
+               not f.startswith('log')]
+
+for f in remove_list:
+    tmp = os.path.join(args.res_dir, f)
+    if not os.path.isdir(tmp) and not args.keep_old:
+        os.remove(tmp)
+
+if not args.keep_old:
+    # backup current .py files
+    copy('train_directed.py', args.res_dir)
+    copy('models.py', args.res_dir)
+    copy('util.py', args.res_dir)
+    copy('GCN/gcn.py', args.res_dir)
+    copy('GCN/layers.py', args.res_dir)
+
+# save command line input
+cmd_input = 'python ' + ' '.join(sys.argv) + '\n'
+with open(os.path.join(args.res_dir, 'cmd_input.txt'), 'a') as f:
+    f.write(cmd_input)
+print('Command line input: ' + cmd_input + ' is saved.')
+
+edge_label, features, labels, edges, idx_train, idx_test, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H = train_data
+
+# model
+model = eval(args.model)(
+    max_n=graph_args.max_n,
+    max_edge_n=graph_args.max_n_eg,
+    n_vertex_type=graph_args.num_vertex_type,
+    hidden_dim=args.hs,
+    z_dim=args.nz,
+    feature_dimension=features.size(1),
+    with_neighbor=args.with_neighbor,
+    with_vertex=args.with_vertex,
+    node_classification=args.node_classification,
+    with_sub=False
+)
+
+if args.data_type == 'WebKB':
+    node_idx = list(range(features.size(0)))
+    random.shuffle(node_idx)
+    node_idx = torch.tensor(node_idx)
+    TEST = int(node_idx.size(0) * .4)
+    node_idx_train = node_idx[:-TEST].to(device)
+    node_idx_test = node_idx[-TEST:].to(device)
+else:
+    node_idx = list(range(features.size(0)))
+    node_idx_train = []
+    node_idx_test = []
+
+    for i in range(graph_args.num_vertex_type):
+        ids = node_idx[labels == i]
+        idx_tmp = list(range(ids.size(0)))
+        random.shuffle(idx_tmp)
+        idx_tmp = torch.tensor(idx_tmp)
+
+        ids = ids.index_select(dim=0, index=idx_tmp)
+
+        node_idx_train.append(ids[:-20])
+        node_idx_test.append(ids[-20:])
+
+    node_idx_train = torch.cat(node_idx_train, dim=0)
+    idx_tmp = list(range(node_idx_train.size(0)))
+    random.shuffle(idx_tmp)
+    idx_tmp = torch.tensor(idx_tmp)
+    node_idx_train = node_idx_train.index_select(dim=0, index=idx_tmp).to(device)
+
+    node_idx_test = torch.cat(node_idx_test, dim=0)
+    idx_tmp = list(range(node_idx_test.size(0)))
+    random.shuffle(idx_tmp)
+    node_idx_test = node_idx_test.index_select(dim=0, index=idx_tmp).to(device)
+
+optimizer = optim.Adam(model.parameters(), lr=args.lr)
+scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=10, verbose=True)
+model.to(device)
+
+if args.continue_from is not None:
+    epoch = args.continue_from
+    load_module_state(model, os.path.join(args.res_dir, 'model_checkpoint{}.pth'.format(epoch)))
+    load_module_state(optimizer, os.path.join(args.res_dir, 'optimizer_checkpoint{}.pth'.format(epoch)))
+    load_module_state(scheduler, os.path.join(args.res_dir, 'scheduler_checkpoint{}.pth'.format(epoch)))
+
+temp_min = 0.3
+ANNEAL_RATE = 0.00003
+
+def acc(pred, label):
+    #print(pred.shape, label.shape)
+    correct = pred.eq(label).sum().item()
+    acc = correct / len(pred)
+    return acc
+
+def train(epoch):
+    model.train()
+    train_loss = 0
+    adj_ls = 0
+    inci_ls = 0
+    ver_ls = 0
+    inci_T_ls = 0
+    kld_loss = 0
+
+    edge_label, features, labels, edge_list, idx_train, idx_test, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H = train_data
+
+    if not args.add_mask:
+        inci_mat_T = inci_lb_T
+        inci_mat_H = inci_lb_H
+
+    features = features.to(device)
+    inci_mat_T = inci_mat_T.to(device)
+    inci_mat_H = inci_mat_H.to(device)
+
+    arch = (0, labels, features, inci_mat_T, inci_mat_H, weight_T, weight_H, 0, edges)
+
+    mean, logvar, sampled_z = model.encode(arch)
+    optimizer.zero_grad()
+
+    loss, ver_loss, adj_loss, inci_loss, inci_T_loss, kld = model.loss(mean, logvar, sampled_z, arch)
+
+    print('Epoch: %d, loss: %0.4f, ver: %0.4f, adj: %0.4f, inci: %0.4f, inci_T: %0.4f, kld: %0.4f' %
+              (epoch, loss.item() , ver_loss.item() ,
+               adj_loss.item() , inci_loss.item() ,
+               inci_T_loss.item() , kld.item() ))
+
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10, norm_type=2)
+
+    train_loss += float(loss)
+    ver_ls += float(ver_loss)
+    adj_ls += float(adj_loss)
+    inci_ls += float(inci_loss)
+    inci_T_ls += float(inci_T_loss)
+    kld_loss += float(kld)
+
+    optimizer.step()
+
+    logging.info("Epoch: %03d | Average loss: %.6f | Ver: %.6f | Adj: %.6f | Inci: %.6f | Inci_T: %.6f | KL: %.6f |",
+                 epoch, train_loss / len(train_data)
+                 , ver_ls / len(train_data), adj_ls / len(train_data), inci_ls / len(train_data),
+                 inci_T_ls / len(train_data), kld_loss / len(train_data))
+
+
+    return train_loss, ver_ls, adj_ls, inci_ls, inci_T_ls, kld_loss
+
+
+def test_during_train():
+    # test recon accuracy
+    model.eval()
+    print('Accuracy testing begins...')
+
+    edge_label, features, labels, edge_list, _, _, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H = train_data
+
+    features = features.to(device)
+
+    if not args.add_mask:
+        inci_mat_T = inci_lb_T
+        inci_mat_H = inci_lb_H
+
+    inci_mat_T = inci_mat_T.to(device)
+    inci_mat_H = inci_mat_H.to(device)
+
+    arch = (0, labels, features, inci_mat_T, inci_mat_H, weight_T, weight_H, 0, edges)
+
+    _, _, sampled_z = model.encode(arch)
+    vertex_pred, inci_pred = model.calculate_accuracy(sampled_z)
+
+    inci = inci_mat_T * -1 + inci_mat_H
+
+    labels = labels.to(device)
+    vertex_pred = vertex_pred.index_select(dim=0, index=node_idx_test)
+    labels = labels.index_select(dim=0, index=node_idx_test)
+
+    edge_error = (inci != inci_pred).float().sum().tolist() # torch.abs((inci.permute(0, 2, 1) + inci_pred).float()).sum().tolist()
+    vertex_error = (vertex_pred.squeeze(dim=-1) != labels).float().sum().tolist()
+
+    vertex_error = vertex_error / graph_args.max_n
+    edge_error = edge_error / (graph_args.max_true_ng * graph_args.max_n)
+
+    edges_pred = model.decode(sampled_z)
+    label = []
+    pred = []
+    acc = 0
+
+    for (eg, eg_l) in zip(edge_list.tolist(), edge_label.tolist()):
+        if eg in edges_pred and eg_l == 1:
+            acc = acc + 1
+            pred.append(1)
+            label.append(1)
+
+        elif eg not in edges_pred and eg_l == 1:
+            pred.append(0)
+            label.append(1)
+
+        elif eg not in edges_pred and eg_l == 0:
+            acc = acc + 1
+            pred.append(0)
+            label.append(0)
+
+        elif eg in edges_pred and eg_l == 0:
+            pred.append(1)
+            label.append(0)
+
+    acc_direct = float(acc / len(edge_list))
+    f_1 = f1_score(label, pred)
+
+    logging.info('Test average Vertex error: {0}, Edge error: {1:.4f}, Direct acc: {2:.4f}, f1: {3:.4f}'.format(vertex_error, edge_error, acc_direct, f_1))
+    return vertex_error, edge_error
+
+
+def test():
+    # test recon accuracy
+    model.eval()
+    decode_times = 10
+
+    print('Testing begins...')
+
+    edge_label, features, labels, edge_list, _, idt, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H = test_data
+
+    if not args.add_mask:
+        inci_mat_T = inci_lb_T
+        inci_mat_H = inci_lb_H
+
+    features = features.to(device)
+    inci_mat_T = inci_mat_T.to(device)
+    inci_mat_H = inci_mat_H.to(device)
+    inci_lb_H = inci_lb_H.to(device)
+    inci_lb_T = inci_lb_T.to(device)
+    weight_T = weight_T.to(device)
+    weight_H = weight_H.to(device)
+    idt = idt.to(device)
+    edge_list = edge_list.to(device)
+    edge_label = edge_label.to(device)
+
+    arch = (0, labels, features, inci_mat_T, inci_mat_H, weight_T, weight_H, 0, edges)
+
+    mean, logvar, sampled_z = model.encode(arch)
+
+    loss, ver_loss, adj_loss, inci_loss, inci_T_loss, kld = model.loss(mean, logvar, sampled_z, arch)
+
+    edge_label = edge_label.to(device)
+    edges_list = edge_list.to(device)
+    edges_list = edges_list.index_select(dim=0, index=idt)
+    edge_label = edge_label.index_select(dim=0, index=idt)
+
+    print('test result | loss: %0.4f, ver: %0.4f, adj: %0.4f, inci: %0.4f, inci_T: %0.4f, kld: %0.4f' %
+              (loss.item() , ver_loss.item() ,
+               adj_loss.item() , inci_loss.item() ,
+               inci_T_loss.item() , kld.item() ))
+
+
+    acc_total = 0
+    f1_total = 0
+
+    for _ in range(decode_times):
+        edges_pred = model.decode(sampled_z)
+        label = []
+        pred = []
+        acc = 0
+
+        for (eg, eg_l) in zip(edges_list.cpu().tolist(), edge_label.cpu().tolist()):
+            if eg in edges_pred and eg_l == 1:
+                acc = acc + 1
+                pred.append(1)
+                label.append(1)
+
+            elif eg not in edges_pred and eg_l == 1:
+                pred.append(0)
+                label.append(1)
+
+            elif eg not in edges_pred and eg_l == 0:
+                acc = acc + 1
+                pred.append(0)
+                label.append(0)
+
+            elif eg in edges_pred and eg_l == 0:
+                pred.append(1)
+                label.append(0)
+
+        acc_total = acc_total + float(acc / edges_list.size(0))
+        f1_total = f1_total + f1_score(label, pred)
+
+    f1_total = float(f1_total / decode_times)
+    acc_total = float(acc_total / decode_times)
+
+    print('Link prediction result: {0:.4f}, f1 score: {1:.4f}'.format(acc_total, f1_total))
+    return f1_total, acc_total
+
+'''Training begins here'''
+start_epoch = args.continue_from if args.continue_from is not None else 0
+
+# for epoch in range(start_epoch + 1, args.epochs + 1):
+#     train_loss, ver_ls, adj_ls, inci_ls, edge_ls, kld_loss = train(epoch)
+#     pred_loss = 0.0
+#     scheduler.step(train_loss)
+#     if epoch % args.save_interval == 0:
+#         print("save current model...")
+#         model_name = os.path.join(args.res_dir, 'model_checkpoint{}.pth'.format(epoch))
+#         optimizer_name = os.path.join(args.res_dir, 'optimizer_checkpoint{}.pth'.format(epoch))
+#         scheduler_name = os.path.join(args.res_dir, 'scheduler_checkpoint{}.pth'.format(epoch))
+#         torch.save(model.state_dict(), model_name)
+#         torch.save(optimizer.state_dict(), optimizer_name)
+#         torch.save(scheduler.state_dict(), scheduler_name)
+#
+#         _, _ = test_during_train()
+
+
+######################################################################
+######################################################################
+# edge predictor                                                     #
+######################################################################
+
+predictor_model = Edge_Predictor(args.hs * 4 + args.nz * 2, args.hs)
+optimizer_pred = optim.Adam(predictor_model.parameters(), lr=args.lr)
+scheduler_pred = ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=10, verbose=True)
+predictor_model.to(device)
+
+def train_edge(epoch):
+    # test recon accuracy
+    model.eval()
+    predictor_model.train()
+
+    print('Directed link prediction training begins...')
+
+    edge_label, features, labels, edge_list, train_idx, test_idx, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H = train_data
+
+    if not args.add_mask:
+        inci_mat_T = inci_lb_T
+        inci_mat_H = inci_lb_H
+
+    features = features.to(device)
+    inci_mat_T = inci_mat_T.to(device)
+    inci_mat_H = inci_mat_H.to(device)
+    edge_list = edge_list.to(device)
+    edge_label = edge_label.to(device)
+    labels = labels.to(device)
+    train_idx = train_idx.to(device)
+
+    arch = (0, labels, features, inci_mat_T, inci_mat_H, weight_T, weight_H, 0, edges)
+
+    mean, logvar, sampled_z = model.encode(arch)
+
+    node_pred_loss, node_pred_acc, f1_edge = predictor_model(sampled_z, edge_label, train_idx)
+
+    optimizer_pred.zero_grad()
+    node_pred_loss.backward()
+    torch.nn.utils.clip_grad_norm_(predictor_model.parameters(), max_norm=10, norm_type=2)
+    optimizer_pred.step()
+
+    print('Epoch: %d, edge_pred_loss: %.4f, edge_pred_acc: %.4f, f1: %.4f' %
+          (epoch, node_pred_loss.item(), node_pred_acc, f1_edge))
+
+    return node_pred_loss, node_pred_acc, f1_edge
+
+
+def test_edge():
+    # test recon accuracy
+    model.eval()
+    predictor_model.eval()
+
+    print('Directed link prediction training begins...')
+
+    edge_label, features, labels, edge_list, train_idx, test_idx, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H = test_data
+
+    if not args.add_mask:
+        inci_mat_T = inci_lb_T
+        inci_mat_H = inci_lb_H
+
+    features = features.to(device)
+    inci_mat_T = inci_mat_T.to(device)
+    inci_mat_H = inci_mat_H.to(device)
+    edge_list = edge_list.to(device)
+    edge_label = edge_label.to(device)
+    labels = labels.to(device)
+    test_idx = train_idx.to(device)
+
+    arch = (0, labels, features, inci_mat_T, inci_mat_H, weight_T, weight_H, 0, edges)
+
+    mean, logvar, sampled_z = model.encode(arch)
+
+    edge_pred_loss, edge_pred_acc, edge_f1 = predictor_model(sampled_z, edge_label, test_idx)
+
+    print('Test Result =====> : edge_pred_loss: %.4f, edge_pred_acc: %.4f, edge_f1: %.4f' %
+          (edge_pred_loss.item(), edge_pred_acc, edge_f1))
+
+    return edge_pred_loss, edge_pred_acc, edge_f1
+
+
+for epoch in range(1, args.epochs + 1):
+    edge_pred_loss, edge_pred_acc, _ = train_edge(epoch)
+    scheduler_pred.step(edge_pred_loss)
+    if epoch % args.save_interval == 0:
+        _, _, _ = test_edge()
+
+
+
+'''Testing begins here'''
+Nll, acc = test()
