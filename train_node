@@ -1,0 +1,435 @@
+from __future__ import print_function
+import os
+import sys
+import pickle
+import random
+import tqdm
+from shutil import copy
+from torch import nn, optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import scipy.io
+from scipy.linalg import qr
+from random import shuffle
+import matplotlib
+import scipy.stats as stats
+
+from util import *
+from models import *
+import logging
+
+parser = argparse.ArgumentParser(description='Train Variational Directed Graph Auto-Encoders, which is VDGAE')
+# general settings
+parser.add_argument('--data-type', default='WebKB', help='datatype: cora, citeseer, WebKB, WikiCS')
+parser.add_argument('--data-name', default='Cornell', help='graph dataset name: cora, citeseer, Cornell, Texas, Wisconsin, WikiCS')
+parser.add_argument('--save-appendix', default='_VDGAE_node', help='what to append to data-name as save-name for results')
+parser.add_argument('--save-interval', type=int, default=100, metavar='N', help='how many epochs to wait each time to save model states')
+parser.add_argument('--sample-number', type=int, default=20, metavar='N', help='how many samples to generate each time')
+parser.add_argument('--no-test', action='store_true', default=False, help='if True, merge test with train, i.e., no held-out set')
+parser.add_argument('--reprocess', action='store_true', default=True, help='if True, reprocess data instead of using prestored .pkl data')
+parser.add_argument('--keep-old', action='store_true', default=False, help='if True, do not remove any old data in the result folder')
+parser.add_argument('--only-test', action='store_true', default=False, help='if True, perform some experiments without training the model')
+parser.add_argument('--small-train', action='store_true', default=False, help='if True, use a smaller version of train set')
+parser.add_argument('--temp', type=float, default=1.0, metavar='S', help='tau(temperature) (default: 1.0)')
+parser.add_argument('--link-prediction', default=False, help='if True, mask the link randomly')
+parser.add_argument('--add-noise', default=False, help='if True, add noise for link prediction')
+
+# model settings
+parser.add_argument('--model', default='VDGAE', help='model to use: VDGAE')
+parser.add_argument('--continue-from', type=int, default=None, help="from which epoch's checkpoint to continue training")
+parser.add_argument('--hs', type=int, default=64, metavar='N'  , help='hidden size of GRUs')
+parser.add_argument('--nz', type=int, default=32, metavar='N', help='number of dimensions of latent vectors z')
+parser.add_argument('--with_neighbor', default=False, help='if True, add mask for reconstruction')
+parser.add_argument('--with_vertex', default=True, help='if True, add mask for reconstruction')
+parser.add_argument('--node_classification', default=True, help='if True, add mask for reconstruction')
+
+# optimization settings
+parser.add_argument('--lr', type=float, default=1e-3, metavar='LR', help='learning rate (default: 1e-4)')
+parser.add_argument('--epochs', type=int, default=1000, metavar='N', help='number of epochs to train')
+parser.add_argument('--batch-size', type=int, default=32, metavar='N', help='batch size during training')
+parser.add_argument('--infer-batch-size', type=int, default=64, metavar='N', help='batch size during inference')
+parser.add_argument('--no-cuda', action='store_true', default=False, help='disables CUDA training')
+parser.add_argument('--seed', type=int, default=100, metavar='S', help='random seed (default: 1)')
+parser.add_argument('--save', type=str, default='logs')
+
+args = parser.parse_args()
+args.cuda = not args.no_cuda and torch.cuda.is_available()
+torch.manual_seed(args.seed)
+if args.cuda:
+    torch.cuda.manual_seed(args.seed)
+    device = torch.device("cuda:0")
+else:
+    device = torch.device("cpu")
+np.random.seed(args.seed)
+random.seed(args.seed)
+
+# path initializing
+args.file_dir = os.path.dirname(os.path.realpath('__file__'))
+args.res_dir = os.path.join(args.file_dir, 'results/{}{}'.format(args.data_name, args.save_appendix))
+args.save = args.res_dir
+
+if not os.path.exists(args.res_dir):
+    os.makedirs(args.res_dir)
+
+# logging settings
+log_format = '%(asctime)s %(message)s'
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=log_format, datefmt='%m/%d %I:%M:%S %p')
+fh = logging.FileHandler(os.path.join(args.save, 'log.txt'))
+fh.setFormatter(logging.Formatter(log_format))
+logging.getLogger().addHandler(fh)
+logging.info("args = %s", args)
+
+pkl_name = os.path.join(args.res_dir, args.data_name + '.pkl')
+
+# check whether to load pre-stored pickle data
+if os.path.isfile(pkl_name) and not args.reprocess:
+    with open(pkl_name, 'rb') as f:
+        if args.data_type == 'WikiCS':
+            train_data, test_data, test_edge_data, graph_args = pickle.load(f)
+        else:
+            train_data, test_data, test_edge_data, graph_args = pickle.load(f)
+
+# otherwise process the raw data and save to .pkl
+else:
+    # determine data formats according to models, DVAE: igraph, SVAE: string (as tensors)
+    if args.data_type == 'WikiCS':
+        train_data, test_data, test_edge_data, graph_args = load_WikiCS_node(args.data_name)
+    elif args.data_type == 'cora':
+        train_data, test_data, test_edge_data, graph_args = load_cora_node('cora')
+    elif args.data_type == 'citeseer':
+        train_data, test_data, test_edge_data, graph_args = load_citeseer_node('citeseer')
+    elif args.data_type == 'WebKB':
+        train_data, test_data, test_edge_data, graph_args = load_WebKB_node(args.data_name)
+    with open(pkl_name, 'wb') as f:
+        if args.data_type == 'WikiCS':
+            pickle.dump((train_data, test_data, test_edge_data, graph_args), f)
+        else:
+            pickle.dump((train_data, test_data, test_edge_data, graph_args), f)
+
+
+# delete old files in the result directory
+remove_list = [f for f in os.listdir(args.res_dir) if not f.endswith(".pkl") and
+               not f.startswith('train_graph') and not f.startswith('test_graph') and
+               not f.endswith('.pth') and
+               not f.startswith('log')]
+
+for f in remove_list:
+    tmp = os.path.join(args.res_dir, f)
+    if not os.path.isdir(tmp) and not args.keep_old:
+        os.remove(tmp)
+
+if not args.keep_old:
+    # backup current .py files
+    copy('train_node.py', args.res_dir)
+    copy('models.py', args.res_dir)
+    copy('util.py', args.res_dir)
+    copy('GCN/gcn.py', args.res_dir)
+    copy('GCN/layers.py', args.res_dir)
+
+# save command line input
+cmd_input = 'python ' + ' '.join(sys.argv) + '\n'
+with open(os.path.join(args.res_dir, 'cmd_input.txt'), 'a') as f:
+    f.write(cmd_input)
+print('Command line input: ' + cmd_input + ' is saved.')
+
+# construct train data
+if args.no_test:
+    train_data = train_data + test_data
+
+if args.small_train:
+    train_data = train_data[:100]
+
+
+'''Prepare the model'''
+# model
+model = eval(args.model)(
+    max_n=graph_args.max_n,
+    max_edge_n=graph_args.max_n_eg,
+    n_vertex_type=graph_args.num_vertex_type,
+    hidden_dim=args.hs,
+    z_dim=args.nz,
+    feature_dimension=graph_args.feature_dimension,
+    with_neighbor = args.with_neighbor,
+    with_vertex = args.with_vertex,
+    node_classification = args.node_classification
+)
+
+# optimizer and scheduler
+optimizer = optim.Adam(model.parameters(), lr=args.lr)
+scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=10, verbose=True)
+model.to(device)
+
+if args.continue_from is not None:
+    epoch = args.continue_from
+    load_module_state(model, os.path.join(args.res_dir, 'model_checkpoint{}.pth'.format(epoch)))
+    load_module_state(optimizer, os.path.join(args.res_dir, 'optimizer_checkpoint{}.pth'.format(epoch)))
+    load_module_state(scheduler, os.path.join(args.res_dir, 'scheduler_checkpoint{}.pth'.format(epoch)))
+
+temp_min = 0.3
+ANNEAL_RATE = 0.00003
+
+def train(epoch, k_fold):
+    model.train()
+    train_loss = 0
+    adj_ls = 0
+    inci_ls = 0
+    ver_ls = 0
+    inci_T_ls = 0
+    kld_loss = 0
+    pred_loss = 0
+    shuffle(train_data[k_fold])
+    pbar = tqdm.tqdm(train_data[k_fold])
+
+    v_batch = []
+    lb_batch = []
+    ft_batch = []
+    inci_T_batch = []
+    inci_H_batch = []
+    weight_T_batch = []
+    weight_H_batch = []
+    gsub_batch = []
+    edg_batch = []
+    edg_test_batch = []
+    edg_test_lb_batch = []
+
+    for i, (vid, lb, ft, adj, inci_T, inci_H, w_T, w_H, inci_L_T, inci_L_H, egs, ets, etl, g) in enumerate(pbar):
+        v_batch.append(vid.to(device))
+        lb_batch.append(lb.to(device))
+        ft_batch.append(ft.to(device))
+        inci_T_batch.append(inci_T.to(device))
+        inci_H_batch.append(inci_H.to(device))
+        weight_T_batch.append(w_T.to(device))
+        weight_H_batch.append(w_H.to(device))
+        gsub_batch.append(g)
+        edg_batch.append(egs)
+        edg_test_batch.append(ets)
+        edg_test_lb_batch.append(etl)
+
+        if len(v_batch) == args.batch_size or i == len(train_data[k_fold]) - 1:
+            optimizer.zero_grad()
+            g_batch = (
+                    v_batch, lb_batch, ft_batch, inci_T_batch, inci_H_batch, weight_T_batch, weight_H_batch, gsub_batch, edg_batch#, edg_test_batch, edg_test_lb_batch
+            )
+
+            mean, logvar, sampled_z = model.encode(g_batch)
+            loss, ver_loss, adj_loss, inci_loss, inci_T_loss, kld = model.loss(mean, logvar, sampled_z, g_batch)
+
+            pbar.set_description(
+                'Epoch: %d, loss: %0.4f, ver: %0.4f, adj: %0.4f, inci: %0.4f, inci_T: %0.4f, kld: %0.4f' %
+                (epoch, loss.item() / len(g_batch), ver_loss.item() / len(g_batch),
+                 adj_loss.item() / len(g_batch), inci_loss.item() / len(g_batch),
+                 inci_T_loss.item() / len(g_batch), kld.item() / len(g_batch)))
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10, norm_type=2)
+
+            train_loss += float(loss)
+            ver_ls += float(ver_loss)
+            adj_ls += float(adj_loss)
+            inci_ls += float(inci_loss)
+            inci_T_ls += float(inci_T_loss)
+            kld_loss += float(kld)
+
+            optimizer.step()
+            v_batch = []
+            lb_batch = []
+            ft_batch = []
+            inci_T_batch = []
+            inci_H_batch = []
+            weight_T_batch = []
+            weight_H_batch = []
+            gsub_batch = []
+            edg_batch = []
+            edg_test_batch = []
+            edg_test_lb_batch = []
+
+    logging.info("Epoch: %03d | Average loss: %.6f | Ver: %.6f | Adj: %.6f | Inci: %.6f | Inci_T: %.6f | KL: %.6f |",
+                 epoch, train_loss / len(train_data)
+                 , ver_ls / len(train_data), adj_ls / len(train_data), inci_ls / len(train_data),
+                 inci_T_ls / len(train_data), kld_loss / len(train_data))
+
+    return train_loss, ver_ls, adj_ls, inci_ls, inci_T_ls, kld_loss
+
+
+def test_during_train(k_fold):
+    model.eval()
+    edge_error = 0
+    vertex_error = 0
+    f1_loss = 0
+    acc_loss = 0
+    count = 0
+    shuffle(test_data[k_fold])
+    print('Accuracy testing begins...')
+
+    pbar = tqdm.tqdm(test_data[k_fold])
+
+    v_batch = []
+    lb_batch = []
+    ft_batch = []
+    inci_T_batch = []
+    inci_H_batch = []
+    weight_T_batch = []
+    weight_H_batch = []
+    gsub_batch = []
+    edge_batch = []
+    edge_label_batch = []
+    edg_batch = []
+
+    for i, (vid, lb, ft, adj, inci_T, inci_H, w_T, w_H, inci_L_T, inci_L_H, egs, ets, etl, g) in enumerate(pbar):
+        v_batch.append(vid.to(device))
+        lb_batch.append(lb.to(device))
+        ft_batch.append(ft.to(device))
+        inci_T_batch.append(inci_T.to(device))
+        inci_H_batch.append(inci_H.to(device))
+        weight_T_batch.append(w_T.to(device))
+        weight_H_batch.append(w_H.to(device))
+        gsub_batch.append(g)
+        edg_batch.append(egs)
+        edge_batch.append(ets)
+        edge_label_batch.append(etl)
+
+        if len(v_batch) == args.infer_batch_size or i == len(test_data[k_fold]) - 1:
+            g_batch = (
+                v_batch, lb_batch, ft_batch, inci_T_batch, inci_H_batch, weight_T_batch, weight_H_batch, gsub_batch, edg_batch
+            )
+
+            _, _, sampled_z = model.encode(g_batch)
+            vertex_pred, inci_pred = model.calculate_accuracy(sampled_z)
+            acc = 0
+            f1 = 0
+
+            inci_mat_T = torch.cat(inci_T_batch, dim=0)
+            inci_mat_H = torch.cat(inci_H_batch, dim=0)
+            vertex = torch.cat(lb_batch, dim=0)
+
+            inci = inci_mat_T * -1 + inci_mat_H
+
+            edge_error = edge_error + (inci != inci_pred).float().sum().tolist() # torch.abs((inci.permute(0, 2, 1) + inci_pred).float()).sum().tolist()
+            vertex_error = vertex_error + (vertex_pred != vertex).float().sum().tolist()
+
+            f1_loss = f1 + f1_loss
+            acc_loss = acc + acc_loss
+
+            v_batch = []
+            lb_batch = []
+            ft_batch = []
+            inci_T_batch = []
+            inci_H_batch = []
+            weight_T_batch = []
+            weight_H_batch = []
+            gsub_batch = []
+            edge_batch = []
+            edge_label_batch = []
+            edg_batch = []
+            count = count + 1
+
+    vertex_error = vertex_error / (len(test_data[k_fold]) * graph_args.max_n)
+    edge_error = edge_error / (len(test_data[k_fold]) * graph_args.max_n * graph_args.max_n_eg)
+    f1_loss = f1_loss / count
+    acc_loss = acc_loss / count
+
+    logging.info('Test average Vertex error: {0}, Edge error: {1:.4f}, edge acc: {2:.4f}, edge f1: {3:.4f}'.format(vertex_error, edge_error, acc_loss, f1_loss))
+    return vertex_error, edge_error
+
+
+def test(k_fold):
+    model.eval()
+    f1_loss = 0
+    acc_loss = 0
+    vertex_error = 0
+    count = 0
+    print('Testing begins...')
+    shuffle(test_edge_data[k_fold])
+    pbar = tqdm.tqdm(test_edge_data[k_fold])
+
+    v_batch = []
+    lb_batch = []
+    ft_batch = []
+    inci_T_batch = []
+    inci_H_batch = []
+    weight_T_batch = []
+    weight_H_batch = []
+    gsub_batch = []
+    edge_batch = []
+    edge_label_batch = []
+    edg_batch = []
+
+    for i, (vid, lb, ft, adj, inci_T, inci_H, w_T, w_H, inci_L_T, inci_L_H, egs, ets, etl, g) in enumerate(pbar):
+        v_batch.append(vid.to(device))
+        lb_batch.append(lb.to(device))
+        ft_batch.append(ft.to(device))
+        inci_T_batch.append(inci_T.to(device))
+        inci_H_batch.append(inci_H.to(device))
+        weight_T_batch.append(w_T.to(device))
+        weight_H_batch.append(w_H.to(device))
+        edge_batch.append(ets)
+        edge_label_batch.append(etl)
+        gsub_batch.append(g)
+        edg_batch.append(egs)
+
+        if len(v_batch) == args.infer_batch_size or i == len(test_data[k_fold]) - 1:
+            g_batch = (
+                v_batch, lb_batch, ft_batch, inci_T_batch, inci_H_batch, weight_T_batch, weight_H_batch, gsub_batch, edg_batch
+            )
+
+            mean, logvar, sampled_z = model.encode(g_batch)
+            vertex_pred, inci_pred = model.calculate_accuracy(sampled_z)
+
+            vertex = torch.cat(lb_batch, dim=0)
+            vr = (vertex_pred != vertex).float().sum().tolist()
+            vertex_error = vertex_error + vr
+
+            f1 = 0
+            acc = 0
+            pbar.set_description('acc: {:.4f}, f1: {:.4f}, vertex_error: {:.4f}'.format(acc, f1, vr))
+            acc_loss = acc_loss + acc
+            f1_loss = f1_loss + f1
+
+            v_batch = []
+            lb_batch = []
+            ft_batch = []
+            inci_T_batch = []
+            inci_H_batch = []
+            weight_T_batch = []
+            weight_H_batch = []
+            gsub_batch = []
+            edge_batch = []
+            edge_label_batch = []
+            edg_batch = []
+            count = count + 1
+
+    acc_loss = acc_loss / count
+    f1_loss = f1_loss / count
+
+    vertex_error = vertex_error / (len(test_data[k_fold]) * graph_args.max_n)
+
+
+    print('Test average acc: {0}, average acc: {1:.4f}, vertex err: {2:.4f}'.format(acc_loss, f1_loss, vertex_error))
+    return acc_loss, f1_loss
+
+
+min_loss = math.inf  # >= python 3.5
+min_loss_epoch = None
+loss_name = os.path.join(args.res_dir, 'train_loss.txt')
+loss_plot_name = os.path.join(args.res_dir, 'train_loss_plot.pdf')
+test_results_name = os.path.join(args.res_dir, 'test_results.txt')
+
+if __name__ == '__main__':
+    for i in range(10):
+        start_epoch = args.continue_from if args.continue_from is not None else 0
+        for epoch in range(start_epoch + 1, args.epochs + 1):
+            train_loss, ver_ls, adj_ls, inci_ls, edge_ls, kld_loss = train(epoch, i)
+            scheduler.step(train_loss)
+            if epoch % args.save_interval == 0:
+                print("save current model...")
+                model_name = os.path.join(args.res_dir, 'model_checkpoint{}.pth'.format(epoch))
+                optimizer_name = os.path.join(args.res_dir, 'optimizer_checkpoint{}.pth'.format(epoch))
+                scheduler_name = os.path.join(args.res_dir, 'scheduler_checkpoint{}.pth'.format(epoch))
+                torch.save(model.state_dict(), model_name)
+                torch.save(optimizer.state_dict(), optimizer_name)
+                torch.save(scheduler.state_dict(), scheduler_name)
+                _, _ = test_during_train(i)
+
+        Nll, acc = test(i)
+        pred_rmse = 0
+
+
