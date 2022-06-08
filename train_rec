@@ -17,7 +17,7 @@ parser.add_argument('--data-name', default='cora', help='graph dataset name: Cor
 parser.add_argument('--nvt', type=int, default=6, help='number of different node types')
 parser.add_argument('--save-appendix', default='_reconstruction', help='suffix for results')
 parser.add_argument('--save-interval', type=int, default=100, metavar='N', help='interval for saving model states')
-parser.add_argument('--reprocess', action='store_true', default=True, help='if True, reprocess training data, else use the already processed one saved in .pk')
+parser.add_argument('--reprocess', action='store_true', default=False, help='if True, reprocess training data, else use the already processed one saved in .pk')
 parser.add_argument('--keep-old', action='store_true', default=False, help='if True, keep old data in the result folder')
 parser.add_argument('--link-prediction', default=False, help='if True, mask the link randomly')
 parser.add_argument('--add-mask', default=False, help='if True, add mask for reconstruction')
@@ -132,40 +132,6 @@ model = eval(args.model)(
     with_sub=False
 )
 
-if args.data_type == 'WebKB':
-    node_idx = list(range(features.size(0)))
-    random.shuffle(node_idx)
-    node_idx = torch.tensor(node_idx)
-    TEST = int(node_idx.size(0) * .4)
-    node_idx_train = node_idx[:-TEST].to(device)
-    node_idx_test = node_idx[-TEST:].to(device)
-else:
-    node_idx = list(range(features.size(0)))
-    node_idx_train = []
-    node_idx_test = []
-
-    for i in range(graph_args.num_vertex_type):
-        ids = node_idx[labels == i]
-        idx_tmp = list(range(ids.size(0)))
-        random.shuffle(idx_tmp)
-        idx_tmp = torch.tensor(idx_tmp)
-
-        ids = ids.index_select(dim=0, index=idx_tmp)
-
-        node_idx_train.append(ids[:-20])
-        node_idx_test.append(ids[-20:])
-
-    node_idx_train = torch.cat(node_idx_train, dim=0)
-    idx_tmp = list(range(node_idx_train.size(0)))
-    random.shuffle(idx_tmp)
-    idx_tmp = torch.tensor(idx_tmp)
-    node_idx_train = node_idx_train.index_select(dim=0, index=idx_tmp).to(device)
-
-    node_idx_test = torch.cat(node_idx_test, dim=0)
-    idx_tmp = list(range(node_idx_test.size(0)))
-    random.shuffle(idx_tmp)
-    node_idx_test = node_idx_test.index_select(dim=0, index=idx_tmp).to(device)
-
 optimizer = optim.Adam(model.parameters(), lr=args.lr)
 scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=10, verbose=True)
 model.to(device)
@@ -261,8 +227,6 @@ def test_during_train():
     inci = inci_mat_T * -1 + inci_mat_H
 
     labels = labels.to(device)
-    vertex_pred = vertex_pred.index_select(dim=0, index=node_idx_test)
-    labels = labels.index_select(dim=0, index=node_idx_test)
 
     edge_error = (inci != inci_pred).float().sum().tolist() # torch.abs((inci.permute(0, 2, 1) + inci_pred).float()).sum().tolist()
     vertex_error = (vertex_pred.squeeze(dim=-1) != labels).float().sum().tolist()
