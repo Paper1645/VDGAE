@@ -24,7 +24,7 @@ parser.add_argument('--add-mask', default=False, help='if True, add mask for rec
 
 # model settings
 parser.add_argument('--model', default='VDGAE')
-parser.add_argument('--continue-from', type=int, default=1000, help="from specific checkpoint to continue the training process")
+parser.add_argument('--continue-from', type=int, default=None, help="from specific checkpoint to continue the training process")
 parser.add_argument('--hs', type=int, default=64, metavar='N', help='hidden size of the model')
 parser.add_argument('--nz', type=int, default=32, metavar='N', help='number of dimensions of the latent vectors z')
 parser.add_argument('--with_neighbor', default=False, help='if True, add mask for reconstruction')
@@ -131,40 +131,6 @@ model = eval(args.model)(
     node_classification=args.node_classification,
     with_sub=False
 )
-
-if args.data_type == 'WebKB':
-    node_idx = list(range(features.size(0)))
-    random.shuffle(node_idx)
-    node_idx = torch.tensor(node_idx)
-    TEST = int(node_idx.size(0) * .4)
-    node_idx_train = node_idx[:-TEST].to(device)
-    node_idx_test = node_idx[-TEST:].to(device)
-else:
-    node_idx = list(range(features.size(0)))
-    node_idx_train = []
-    node_idx_test = []
-
-    for i in range(graph_args.num_vertex_type):
-        ids = node_idx[labels == i]
-        idx_tmp = list(range(ids.size(0)))
-        random.shuffle(idx_tmp)
-        idx_tmp = torch.tensor(idx_tmp)
-
-        ids = ids.index_select(dim=0, index=idx_tmp)
-
-        node_idx_train.append(ids[:-20])
-        node_idx_test.append(ids[-20:])
-
-    node_idx_train = torch.cat(node_idx_train, dim=0)
-    idx_tmp = list(range(node_idx_train.size(0)))
-    random.shuffle(idx_tmp)
-    idx_tmp = torch.tensor(idx_tmp)
-    node_idx_train = node_idx_train.index_select(dim=0, index=idx_tmp).to(device)
-
-    node_idx_test = torch.cat(node_idx_test, dim=0)
-    idx_tmp = list(range(node_idx_test.size(0)))
-    random.shuffle(idx_tmp)
-    node_idx_test = node_idx_test.index_select(dim=0, index=idx_tmp).to(device)
 
 optimizer = optim.Adam(model.parameters(), lr=args.lr)
 scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=10, verbose=True)
