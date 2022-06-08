@@ -12,12 +12,12 @@ import logging
 
 parser = argparse.ArgumentParser(description='Train Variational Directed Graph Auto-Encoders')
 # general settings
-parser.add_argument('--data-type', default='cora', help='graph datatype name: WebKB, cora, citeseer, WikiCS')
-parser.add_argument('--data-name', default='cora', help='graph dataset name: Cornell, Texas, Wisconsin, cora, citeseer, WikiCS')
+parser.add_argument('--data-type', default='citeseer', help='graph datatype name: WebKB, cora, citeseer, WikiCS')
+parser.add_argument('--data-name', default='citeseer', help='graph dataset name: Cornell, Texas, Wisconsin, cora, citeseer, WikiCS')
 parser.add_argument('--nvt', type=int, default=6, help='number of different node types')
-parser.add_argument('--save-appendix', default='_reconstruction', help='suffix for results')
+parser.add_argument('--save-appendix', default='_directed_link_prediction', help='suffix for results')
 parser.add_argument('--save-interval', type=int, default=100, metavar='N', help='interval for saving model states')
-parser.add_argument('--reprocess', action='store_true', default=False, help='if True, reprocess training data, else use the already processed one saved in .pk')
+parser.add_argument('--reprocess', action='store_true', default=True, help='if True, reprocess training data, else use the already processed one saved in .pk')
 parser.add_argument('--keep-old', action='store_true', default=False, help='if True, keep old data in the result folder')
 parser.add_argument('--link-prediction', default=False, help='if True, mask the link randomly')
 parser.add_argument('--add-mask', default=False, help='if True, add mask for reconstruction')
@@ -104,7 +104,7 @@ for f in remove_list:
 
 if not args.keep_old:
     # backup current .py files
-    copy('train_reconstruction.py', args.res_dir)
+    copy('train_directed.py', args.res_dir)
     copy('models.py', args.res_dir)
     copy('util.py', args.res_dir)
     copy('GCN/gcn.py', args.res_dir)
@@ -343,9 +343,6 @@ def test():
     print('Link prediction result: {0:.4f}, f1 score: {1:.4f}'.format(acc_total, f1_total))
     return f1_total, acc_total
 
-'''Testing begins here'''
-Nll, acc = test()
-
 '''Training begins here'''
 start_epoch = args.continue_from if args.continue_from is not None else 0
 
@@ -364,6 +361,98 @@ for epoch in range(start_epoch + 1, args.epochs + 1):
 
         _, _ = test_during_train()
 
-_, _ = test_during_train()
+'''Testing begins here'''
+Nll, acc = test()
+
+
+######################################################################
+# edge predictor                                                     #
+######################################################################
+
+predictor_model = Edge_Predictor(args.hs * 4 + args.nz * 2, args.hs)
+optimizer_pred = optim.Adam(predictor_model.parameters(), lr=args.lr)
+scheduler_pred = ReduceLROnPlateau(optimizer, 'min', factor=0.1, patience=10, verbose=True)
+predictor_model.to(device)
+
+def train_edge(epoch):
+    # test recon accuracy
+    model.eval()
+    predictor_model.train()
+
+    print('Directed link prediction training begins...')
+
+    edge_label, features, labels, edge_list, train_idx, test_idx, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H = train_data
+
+    if not args.add_mask:
+        inci_mat_T = inci_lb_T
+        inci_mat_H = inci_lb_H
+
+    features = features.to(device)
+    inci_mat_T = inci_mat_T.to(device)
+    inci_mat_H = inci_mat_H.to(device)
+    edge_list = edge_list.to(device)
+    edge_label = edge_label.to(device)
+    labels = labels.to(device)
+    train_idx = train_idx.to(device)
+
+    arch = (0, labels, features, inci_mat_T, inci_mat_H, weight_T, weight_H, 0, edges)
+
+    mean, logvar, sampled_z = model.encode(arch)
+
+    node_pred_loss, node_pred_acc, f1_edge = predictor_model(sampled_z, edge_label, train_idx)
+
+    optimizer_pred.zero_grad()
+    node_pred_loss.backward()
+    torch.nn.utils.clip_grad_norm_(predictor_model.parameters(), max_norm=10, norm_type=2)
+    optimizer_pred.step()
+
+    print('Epoch: %d, edge_pred_loss: %.4f, edge_pred_acc: %.4f, f1: %.4f' %
+          (epoch, node_pred_loss.item(), node_pred_acc, f1_edge))
+
+    return node_pred_loss, node_pred_acc, f1_edge
+
+
+def test_edge():
+    # test recon accuracy
+    model.eval()
+    predictor_model.eval()
+
+    print('Directed link prediction training begins...')
+
+    edge_label, features, labels, edge_list, train_idx, test_idx, inci_mat_T, inci_mat_H, inci_lb_T, inci_lb_H, weight_T, weight_H = test_data
+
+    if not args.add_mask:
+        inci_mat_T = inci_lb_T
+        inci_mat_H = inci_lb_H
+
+    features = features.to(device)
+    inci_mat_T = inci_mat_T.to(device)
+    inci_mat_H = inci_mat_H.to(device)
+    edge_list = edge_list.to(device)
+    edge_label = edge_label.to(device)
+    labels = labels.to(device)
+    test_idx = train_idx.to(device)
+
+    arch = (0, labels, features, inci_mat_T, inci_mat_H, weight_T, weight_H, 0, edges)
+
+    mean, logvar, sampled_z = model.encode(arch)
+
+    edge_pred_loss, edge_pred_acc, edge_f1 = predictor_model(sampled_z, edge_label, test_idx)
+
+    print('Test Result =====> : edge_pred_loss: %.4f, edge_pred_acc: %.4f, edge_f1: %.4f' %
+          (edge_pred_loss.item(), edge_pred_acc, edge_f1))
+
+    return edge_pred_loss, edge_pred_acc, edge_f1
+
+
+for epoch in range(1, args.epochs + 1):
+    edge_pred_loss, edge_pred_acc, _ = train_edge(epoch)
+    scheduler_pred.step(edge_pred_loss)
+    if epoch % args.save_interval == 0:
+        _, _, _ = test_edge()
+
+_, _, _ = test_edge()
+
+
 
 
